@@ -32,9 +32,9 @@ type Param struct {
 }
 // 示例输入
 // paramStr := "101,2025011514173976211572,cursor|val3"
-// procName := "p_snsj_order_lock"
+// procName := "p_order_lock"
 
-// paramStr := "101,2025011415334104634615,cursor|val3"
+// paramStr := "101,2025011415334104634615,cursor|val3, cursor|val2, int|val1, string|val"
 // procName := "p_order_acc"
 
 // paramStr := "1,222,cursor|val3"
