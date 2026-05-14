@@ -150,11 +150,7 @@ func initDb() error {
 
 // 连接健康检查
 func checkConnectionHealth()  {
-    dbManager.mu.RLock()
-    currentDB := dbManager.db
-    dbManager.mu.RUnlock()
-    
-    if currentDB == nil {
+    if dbManager.db == nil {
         logs.Warn("数据库连接为空")
         dbManager.status.Store(false)
         return
@@ -162,29 +158,16 @@ func checkConnectionHealth()  {
     
     // 快速健康检查
     ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    err := currentDB.PingContext(ctx)
+    err := dbManager.db.PingContext(ctx)
     cancel()
     
     if err != nil {
         logs.Warnf("数据库健康检查失败: %v", err)
         dbManager.status.Store(false)
-        
-        // 异步重建连接
-        go func() {
-            if dbManager.reconnecting.CompareAndSwap(false, true) {
-                defer dbManager.reconnecting.Store(false)
-                logs.Info("开始异步重建数据库连接...")
-                if err := initDb(); err != nil {
-                    logs.Errorf("数据库异步重连失败: %v", err)
-                } else {
-                    logs.Info("数据库连接已异步重建")
-                }
-            }
-        }()
     } else {
         dbManager.status.Store(true)
         // 记录连接池统计
-        stats := currentDB.Stats()
+        stats := dbManager.db.Stats()
         logs.Infof("连接池统计: 总数=%d, 使用中=%d, 空闲=%d, 等待=%d",
             stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount)
     }
@@ -198,60 +181,52 @@ func startConnectionMonitor() {
     defer ticker.Stop()
     
     for range ticker.C {
-        checkConnectionHealth()
+		checkConnectionHealth()
     }
 }
 
 // 改进的 getDB - 解决锁竞争问题
 func getDB() (*sql.DB, error) {
-    // 快速路径：检查状态
-    if dbManager.status.Load() {
-        dbManager.mu.RLock()
-        currentDB := dbManager.db
-        dbManager.mu.RUnlock()
-        if currentDB != nil {
-            // 快速Ping检查
-            ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-            err := currentDB.PingContext(ctx)
-            cancel()
-            if err == nil {
-                return currentDB, nil
-            }
-            // Ping失败，标记状态
-            dbManager.status.Store(false)
-            logs.Debugf("数据库快速检查失败: %v", err)
+    
+    // 1. 快速路径检查
+    if dbManager.status.Load() && dbManager.db != nil {
+        ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+        err := dbManager.db.PingContext(ctx)
+        cancel()
+        if err == nil {
+            return dbManager.db, nil
         }
+        // Ping失败
+        dbManager.status.Store(false)
+        logs.Info("数据库快速检查失败: %v", err)
     }
     
-    // 慢速路径：需要重建连接
-    // 使用原子操作避免多个goroutine同时重建
+    // 2. 尝试重建连接
     if dbManager.reconnecting.CompareAndSwap(false, true) {
-        defer dbManager.reconnecting.Store(false)
-        logs.Info("数据库连接异常重建")
-        // 获取写锁重建连接
+        defer func() {
+            dbManager.reconnecting.Store(false)
+        }()
+        
+        logs.Info("开始重建数据库连接...")
+        
         if err := initDb(); err != nil {
             logs.Errorf("数据库重建失败: %v", err)
             return nil, fmt.Errorf("数据库连接失败: %v", err)
         }
-        dbManager.mu.RLock()
-        db := dbManager.db
-        dbManager.mu.RUnlock()
-        return db, nil
+        
+        logs.Info("数据库连接重建成功")
+        return dbManager.db, nil
     }
     
     // 如果已经有goroutine在重建，等待并重试
     for i := 0; i < 10; i++ {
-        time.Sleep(50 * time.Millisecond)
-        if dbManager.status.Load() {
-            dbManager.mu.RLock()
-            currentDB := dbManager.db
-            dbManager.mu.RUnlock()
-            if currentDB != nil {
-                return currentDB, nil
+        time.Sleep(200 * time.Millisecond)
+        if dbManager.status.Load() && dbManager.db != nil {
+            if dbManager.db != nil {
+                return dbManager.db, nil
             }
         }
     }
-    
     return nil, fmt.Errorf("获取数据库连接超时")
 }
 
